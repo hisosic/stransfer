@@ -1,0 +1,34 @@
+# 테스트 생성 파일들
+*.bin
+performance_test.*
+test_data/
+server_files/
+downloaded_files/
+uploaded_directory/
+
+# 로그 파일
+*.log
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 임시 파일
+*.tmp
+*.temp
+simple_test.txt
+test_input.txt
+test_output.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db 
