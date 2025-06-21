@@ -187,7 +187,9 @@ class FileTransferServer:
             expected_checksum = message['checksum']
             
             # 디렉토리 생성
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            target_dir = os.path.dirname(target_path)
+            if target_dir:  # 디렉토리가 있는 경우에만 생성
+                os.makedirs(target_dir, exist_ok=True)
             
             # 파일 수신
             received_data = b''
@@ -407,7 +409,9 @@ class FileTransferClient:
                     continue
                 
                 # 디렉토리 생성
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                local_dir = os.path.dirname(local_path)
+                if local_dir:  # 디렉토리가 있는 경우에만 생성
+                    os.makedirs(local_dir, exist_ok=True)
                 
                 # 파일 저장
                 async with aiofiles.open(local_path, 'wb') as f:
