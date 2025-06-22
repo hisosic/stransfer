@@ -151,14 +151,15 @@ class PerformanceMonitor:
             self.logger.info(f"평균 디스크 속도: {disk_speed:.1f} MB/s")
 
 
-# 상수 정의
-CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks (더 큰 청크로 변경)
+# 상수 정의 - 16G 네트워크 극한 최적화
+CHUNK_SIZE = 128 * 1024 * 1024  # 128MB chunks (16G 네트워크 극한 활용)
 COMPRESSION_LEVEL = 1  # 빠른 압축 레벨로 변경
 MAX_RETRIES = 3
-TIMEOUT = 30
-BUFFER_SIZE = 1024 * 1024  # 1MB 버퍼 (증가)
-MAX_CONCURRENT_CHUNKS = 4  # 동시 처리할 청크 수
-PIPELINE_SIZE = 8  # 파이프라인 크기
+TIMEOUT = 120  # 타임아웃 더 증가
+BUFFER_SIZE = 32 * 1024 * 1024  # 32MB 버퍼 (더 증가)
+MAX_CONCURRENT_CHUNKS = 32  # 동시 처리할 청크 수 더 증가
+PIPELINE_SIZE = 64  # 파이프라인 크기 더 증가
+NETWORK_WORKERS_MULTIPLIER = 16  # 네트워크 워커 배수 더 증가
 
 
 @dataclass
@@ -287,11 +288,17 @@ class FileTransferServer:
             # TCP_NODELAY 설정 (Nagle 알고리즘 비활성화)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             
-            # 송수신 버퍼 크기 증가
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE * 4)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE * 4)
+            # 송수신 버퍼 크기 극한 증가 (16G 네트워크 극한용)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE * 16)  # 512MB
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE * 16)  # 512MB
             
-            self.logger.debug(f"클라이언트 {client_addr} TCP 소켓 최적화 완료")
+            # TCP 윈도우 스케일링 활성화
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, BUFFER_SIZE * 16)
+            except:
+                pass  # 일부 시스템에서 지원하지 않을 수 있음
+            
+            self.logger.debug("TCP 소켓 극한 최적화 완료 (16G 네트워크 극한용)")
         
         try:
             while True:
@@ -380,7 +387,7 @@ class FileTransferServer:
                 'temp_file': None,
                 'decompress_queue': asyncio.Queue(maxsize=PIPELINE_SIZE),
                 'write_queue': asyncio.Queue(maxsize=PIPELINE_SIZE),
-                'max_workers': min(psutil.cpu_count(logical=True) * 2, MAX_CONCURRENT_CHUNKS * 2)
+                'max_workers': min(psutil.cpu_count(logical=True) * NETWORK_WORKERS_MULTIPLIER, MAX_CONCURRENT_CHUNKS * 4)
             }
             
             # 임시 파일 열기
@@ -743,7 +750,7 @@ class FileTransferServer:
             
             # CPU 코어 수에 따른 동적 조정
             cpu_count = psutil.cpu_count(logical=True)
-            max_workers = min(cpu_count * 2, MAX_CONCURRENT_CHUNKS * 2)
+            max_workers = min(cpu_count * NETWORK_WORKERS_MULTIPLIER, MAX_CONCURRENT_CHUNKS * 4)
             
             # 파일 체크섬 계산 (병렬로)
             file_checksum = await self._calculate_file_checksum_parallel(remote_path, max_workers)
@@ -755,7 +762,7 @@ class FileTransferServer:
                 'checksum': file_checksum
             })
             
-            self.logger.info(f"고성능 다운로드 시작: {remote_path} ({file_size} bytes, {max_workers} 워커)")
+            self.logger.info(f"다운로드 시작: {remote_path} ({file_size} bytes, {max_workers} 워커)")
             
             # 고성능 병렬 전송
             await self._send_file_parallel(remote_path, writer, file_size, max_workers)
@@ -794,7 +801,7 @@ class FileTransferServer:
             
             # 전송 태스크
             send_task = asyncio.create_task(
-                self._send_compressed_chunks_async(compressed_queue, writer)
+                self._send_compressed_chunks_async(compressed_queue, writer, file_size)
             )
             
             # 모든 태스크 완료 대기
@@ -849,7 +856,7 @@ class FileTransferServer:
                     self.logger.error(f"압축 오류: {e}")
                     break
     
-    async def _send_compressed_chunks_async(self, compressed_queue: asyncio.Queue, writer: asyncio.StreamWriter):
+    async def _send_compressed_chunks_async(self, compressed_queue: asyncio.Queue, writer: asyncio.StreamWriter, file_size: int):
         """압축된 청크를 전송합니다."""
         try:
             sent_bytes = 0
@@ -865,13 +872,17 @@ class FileTransferServer:
                 
                 sent_bytes += len(compressed_data)
                 
-                # 성능 통계 (매 100MB마다)
-                if sent_bytes % (100 * 1024 * 1024) == 0:
+                # 성능 통계 (매 10개 청크마다)
+                if sent_bytes % (10 * 1024 * 1024) == 0 or sent_bytes == file_size:
                     elapsed = time.time() - start_time
                     speed_mbps = (sent_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    progress = (sent_bytes / file_size) * 100
                     
-                    self.logger.info(f"전송 속도: {speed_mbps:.1f} MB/s ({sent_bytes} bytes 전송)")
-                    
+                    self.logger.info(
+                        f"전송 진행률: {progress:.1f}% ({sent_bytes}/{file_size} bytes) "
+                        f"속도: {speed_mbps:.1f} MB/s"
+                    )
+                
         except Exception as e:
             self.logger.error(f"청크 전송 오류: {e}")
             raise
@@ -933,11 +944,17 @@ class FileTransferClient:
                 # TCP_NODELAY 설정 (Nagle 알고리즘 비활성화)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 
-                # 송수신 버퍼 크기 증가
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE * 4)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE * 4)
+                # 송수신 버퍼 크기 극한 증가 (16G 네트워크 극한용)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE * 16)  # 512MB
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE * 16)  # 512MB
                 
-                self.logger.debug("TCP 소켓 최적화 완료")
+                # TCP 윈도우 스케일링 활성화
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, BUFFER_SIZE * 16)
+                except:
+                    pass  # 일부 시스템에서 지원하지 않을 수 있음
+                
+                self.logger.debug("TCP 소켓 극한 최적화 완료 (16G 네트워크 극한용)")
             
             self.logger.info(f"서버에 연결되었습니다: {self.host}:{self.port}")
             return True
@@ -966,11 +983,11 @@ class FileTransferClient:
                     file_size = os.path.getsize(local_path)
                     self.logger.debug(f"파일 크기: {file_size} bytes")
                     
-                    # CPU 코어 수에 따른 동적 조정
+                    # CPU 코어 수에 따른 동적 조정 (16G 네트워크 최적화)
                     cpu_count = psutil.cpu_count(logical=True)
-                    max_workers = min(cpu_count * 2, MAX_CONCURRENT_CHUNKS * 2)
+                    max_workers = min(cpu_count * NETWORK_WORKERS_MULTIPLIER, MAX_CONCURRENT_CHUNKS * 4)
                     
-                    self.logger.info(f"CPU 코어: {cpu_count}, 최대 워커: {max_workers}")
+                    self.logger.info(f"CPU 코어: {cpu_count}, 최대 워커: {max_workers} (16G 네트워크 최적화)")
                     
                     # 전체 파일의 체크섬을 먼저 계산 (병렬로)
                     original_checksum = await self._calculate_file_checksum_parallel(local_path, max_workers)
@@ -1194,8 +1211,8 @@ class FileTransferClient:
                 total_bytes += original_size
                 sent_chunks += 1
                 
-                # 성능 통계 (매 100개 청크마다)
-                if sent_chunks % 100 == 0 or sent_chunks == total_chunks:
+                # 성능 통계 (매 10개 청크마다)
+                if sent_chunks % 10 == 0 or sent_chunks == total_chunks:
                     elapsed = time.time() - start_time
                     speed_mbps = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
                     progress = (sent_chunks / total_chunks) * 100
@@ -1253,7 +1270,9 @@ class FileTransferClient:
                 
                 # CPU 코어 수에 따른 동적 조정
                 cpu_count = psutil.cpu_count(logical=True)
-                max_workers = min(cpu_count * 2, MAX_CONCURRENT_CHUNKS * 2)
+                max_workers = min(cpu_count * NETWORK_WORKERS_MULTIPLIER, MAX_CONCURRENT_CHUNKS * 4)
+                
+                self.logger.info(f"다운로드 시작: {remote_path} ({file_size} bytes, {max_workers} 워커)")
                 
                 # 고성능 병렬 다운로드
                 success = await self._download_file_parallel(local_path, file_size, expected_checksum, max_workers)
@@ -1371,8 +1390,8 @@ class FileTransferClient:
                 await compressed_queue.put(compressed_data)
                 received_size += len(compressed_data)
                 
-                # 성능 통계
-                if received_size % (100 * 1024 * 1024) == 0 or received_size == file_size:
+                # 성능 통계 (매 10개 청크마다)
+                if received_size % (10 * 1024 * 1024) == 0 or received_size == file_size:
                     elapsed = time.time() - start_time
                     speed_mbps = (received_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
                     progress = (received_size / file_size) * 100
@@ -1501,23 +1520,44 @@ async def run_client(host: str, port: int, command: str, local_path: str, remote
 
 
 def optimize_system_resources():
-    """시스템 리소스를 최적화합니다."""
+    """시스템 리소스를 16G 네트워크에 맞게 최적화합니다."""
     try:
         import resource
         
-        # 파일 디스크립터 제한 증가
+        # 파일 디스크립터 제한 대폭 증가
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        new_limit = min(hard, 65536)
+        new_limit = min(hard, 1048576)  # 1M 파일 디스크립터
         resource.setrlimit(resource.RLIMIT_NOFILE, (new_limit, hard))
         
         # 메모리 제한 확인
         memory_limit = resource.getrlimit(resource.RLIMIT_AS)
         
-        print(f"시스템 최적화 완료:")
+        # 네트워크 버퍼 크기 극한 최적화 (Linux만)
+        try:
+            with open('/proc/sys/net/core/rmem_max', 'w') as f:
+                f.write(str(BUFFER_SIZE * 32))  # 1GB
+            with open('/proc/sys/net/core/wmem_max', 'w') as f:
+                f.write(str(BUFFER_SIZE * 32))  # 1GB
+            with open('/proc/sys/net/core/netdev_max_backlog', 'w') as f:
+                f.write('100000')  # 백로그 큐 크기 증가
+            with open('/proc/sys/net/ipv4/tcp_rmem', 'w') as f:
+                f.write('4096 65536 1073741824')  # TCP 수신 버퍼
+            with open('/proc/sys/net/ipv4/tcp_wmem', 'w') as f:
+                f.write('4096 65536 1073741824')  # TCP 송신 버퍼
+            print("  - 네트워크 버퍼 크기 극한 최적화 완료")
+        except (PermissionError, FileNotFoundError):
+            print("  - 네트워크 버퍼 극한 최적화 권한 없음 (sudo 필요)")
+        
+        print(f"16G 네트워크 극한 최적화 완료:")
         print(f"  - 파일 디스크립터 제한: {soft} -> {new_limit}")
         print(f"  - 메모리 제한: {memory_limit[0] if memory_limit[0] != -1 else '무제한'}")
         print(f"  - CPU 코어 수: {psutil.cpu_count(logical=True)}")
         print(f"  - 총 메모리: {psutil.virtual_memory().total/(1024**3):.1f}GB")
+        print(f"  - 청크 크기: {CHUNK_SIZE/(1024**2):.0f}MB")
+        print(f"  - 최대 워커: {psutil.cpu_count(logical=True) * NETWORK_WORKERS_MULTIPLIER}")
+        print(f"  - TCP 버퍼: {BUFFER_SIZE * 16/(1024**2):.0f}MB")
+        print(f"  - 파이프라인: {PIPELINE_SIZE}")
+        print(f"  - 동시 청크: {MAX_CONCURRENT_CHUNKS}")
         
     except ImportError:
         print("리소스 최적화를 위해서는 Unix 시스템이 필요합니다.")
