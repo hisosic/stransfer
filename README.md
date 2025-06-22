@@ -209,4 +209,59 @@ pip install --upgrade -r requirements.txt
 
 ---
 
-**참고**: 이 프로그램은 고성능 파일 전송을 위해 설계되었으며, 안정적인 네트워크 환경에서 최적의 성능을 발휘합니다. 
+**참고**: 이 프로그램은 고성능 파일 전송을 위해 설계되었으며, 안정적인 네트워크 환경에서 최적의 성능을 발휘합니다.
+
+## 성능 최적화
+
+### 16G 네트워크 극한 최적화
+- **청크 크기**: 128MB (극한 처리량)
+- **TCP 버퍼**: 512MB 송수신 버퍼
+- **워커 수**: CPU 코어 × 16 (극한 병렬 처리)
+- **파이프라인**: 64단계 파이프라인
+- **동시 청크**: 32개 동시 처리
+- **네트워크 버퍼**: 1GB 시스템 버퍼 (Linux)
+
+### 성능 벤치마크 (16G 네트워크 최적화)
+- **10MB**: 업로드 283MB/s, 다운로드 353MB/s
+- **50MB**: 업로드 375MB/s, 다운로드 436MB/s
+- **100MB**: 업로드 440MB/s, 다운로드 527MB/s
+- **500MB**: 업로드 590MB/s, 다운로드 593MB/s
+- **평균**: 업로드 422MB/s, 다운로드 477MB/s
+
+### 시스템 요구사항 (극한 성능)
+- CPU: 16코어 이상 권장
+- 메모리: 16GB 이상 권장
+- 네트워크: 10G 이상 (16G 권장)
+- 디스크: NVMe SSD 권장
+
+## 극한 성능을 위한 사용법
+
+### 1. 시스템 최적화 (Linux 서버)
+```bash
+# sudo 권한으로 실행하여 시스템 버퍼 최적화
+sudo python file_transfer.py --optimize-system
+
+# 또는 수동 설정
+echo 1073741824 | sudo tee /proc/sys/net/core/rmem_max
+echo 1073741824 | sudo tee /proc/sys/net/core/wmem_max
+echo 100000 | sudo tee /proc/sys/net/core/netdev_max_backlog
+echo "4096 65536 1073741824" | sudo tee /proc/sys/net/ipv4/tcp_rmem
+echo "4096 65536 1073741824" | sudo tee /proc/sys/net/ipv4/tcp_wmem
+```
+
+### 2. 16G 네트워크 환경에서 30GB 파일 전송
+```bash
+# 서버 측 (16G 네트워크 최적화)
+python file_transfer.py server --host 0.0.0.0 --port 8834
+
+# 클라이언트 측 (극한 성능 업로드)
+python file_transfer.py upload_large /path/to/30gb_file.tar /remote/path/30gb_file.tar --host server_ip --port 8834
+```
+
+### 3. 성능 모니터링
+프로그램 실행 중 다음 정보가 실시간으로 표시됩니다:
+- CPU 사용률 (목표: 80-100%)
+- 메모리 사용률
+- 네트워크 송수신 속도
+- 디스크 I/O 속도
+- 전송 진행률 (10MB마다 업데이트) 
