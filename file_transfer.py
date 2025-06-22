@@ -209,14 +209,15 @@ class FileTransferServer:
             
             self.logger.debug(f"파일 데이터 수신 완료: {len(received_data)} bytes")
             
-            # 압축 해제
+            # 스트리밍 압축 해제
             self.logger.debug("압축 해제 시작")
-            decompressed_data = self.protocol.decompress_data(received_data)
+            decompressor = zstd.ZstdDecompressor()
+            decompressed_data = decompressor.decompress(received_data)
             self.logger.debug(f"압축 해제 완료: {len(decompressed_data)} bytes")
             
             # 체크섬 검증
             self.logger.debug("체크섬 검증 시작")
-            actual_checksum = self.protocol.calculate_checksum(decompressed_data)
+            actual_checksum = xxhash.xxh64(decompressed_data).hexdigest()
             if actual_checksum != expected_checksum:
                 error_msg = f'체크섬 불일치: 예상 {expected_checksum}, 실제 {actual_checksum}'
                 self.logger.error(error_msg)
