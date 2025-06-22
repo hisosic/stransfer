@@ -186,12 +186,16 @@ class FileTransferServer:
             file_size = message['size']
             expected_checksum = message['checksum']
             
+            self.logger.debug(f"업로드 요청 수신: {target_path}, 크기: {file_size} bytes")
+            
             # 디렉토리 생성
             target_dir = os.path.dirname(target_path)
             if target_dir:  # 디렉토리가 있는 경우에만 생성
+                self.logger.debug(f"디렉토리 생성: {target_dir}")
                 os.makedirs(target_dir, exist_ok=True)
             
             # 파일 수신
+            self.logger.debug("파일 데이터 수신 시작")
             received_data = b''
             remaining = file_size
             
@@ -200,33 +204,82 @@ class FileTransferServer:
                 chunk = await reader.readexactly(chunk_size)
                 received_data += chunk
                 remaining -= len(chunk)
+                if len(received_data) % (1024 * 1024) == 0:  # 1MB마다 로그
+                    self.logger.debug(f"수신된 데이터: {len(received_data)}/{file_size} bytes")
+            
+            self.logger.debug(f"파일 데이터 수신 완료: {len(received_data)} bytes")
             
             # 압축 해제
+            self.logger.debug("압축 해제 시작")
             decompressed_data = self.protocol.decompress_data(received_data)
+            self.logger.debug(f"압축 해제 완료: {len(decompressed_data)} bytes")
             
             # 체크섬 검증
+            self.logger.debug("체크섬 검증 시작")
             actual_checksum = self.protocol.calculate_checksum(decompressed_data)
             if actual_checksum != expected_checksum:
+                error_msg = f'체크섬 불일치: 예상 {expected_checksum}, 실제 {actual_checksum}'
+                self.logger.error(error_msg)
                 await self.protocol.send_message(writer, {
                     'status': 'error',
-                    'message': '체크섬 불일치'
+                    'message': error_msg
                 })
                 return
             
+            self.logger.debug("체크섬 검증 통과")
+            
             # 파일 저장
+            self.logger.debug(f"파일 저장 시작: {target_path}")
             async with aiofiles.open(target_path, 'wb') as f:
                 await f.write(decompressed_data)
+            
+            self.logger.info(f"파일 업로드 완료: {target_path} ({len(decompressed_data)} bytes)")
             
             await self.protocol.send_message(writer, {
                 'status': 'success',
                 'message': '파일 업로드 완료'
             })
             
+        except asyncio.IncompleteReadError as e:
+            error_msg = f'데이터 읽기 오류: {str(e)}'
+            self.logger.error(error_msg)
+            try:
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+            except:
+                pass
+        except PermissionError as e:
+            error_msg = f'권한 오류: {str(e)}'
+            self.logger.error(error_msg)
+            try:
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+            except:
+                pass
+        except OSError as e:
+            error_msg = f'파일 시스템 오류: {str(e)}'
+            self.logger.error(error_msg)
+            try:
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+            except:
+                pass
         except Exception as e:
-            await self.protocol.send_message(writer, {
-                'status': 'error',
-                'message': f'업로드 오류: {e}'
-            })
+            error_msg = f'업로드 오류: {type(e).__name__}: {str(e)}'
+            self.logger.error(error_msg)
+            try:
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+            except:
+                pass
     
     async def handle_download(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, message: Dict):
         """파일 다운로드를 처리합니다."""
@@ -334,34 +387,59 @@ class FileTransferClient:
         """파일을 업로드합니다."""
         for attempt in range(retries + 1):
             try:
-                if not os.path.exists(local_path):
-                    self.logger.error(f"파일을 찾을 수 없습니다: {local_path}")
-                    return False
+                # 파일 크기 확인
+                file_size = os.path.getsize(local_path)
+                self.logger.debug(f"파일 크기: {file_size} bytes")
                 
-                # 파일 읽기
+                # 파일을 청크 단위로 읽어서 압축하고 체크섬 계산
+                hasher = xxhash.xxh64()
+                compressor = zstd.ZstdCompressor(level=self.protocol.compression_level)
+                compressed_chunks = []
+                total_compressed_size = 0
+                
                 async with aiofiles.open(local_path, 'rb') as f:
-                    file_data = await f.read()
+                    while True:
+                        chunk = await f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        
+                        hasher.update(chunk)
+                        compressed_chunk = compressor.compress(chunk)
+                        if compressed_chunk:
+                            compressed_chunks.append(compressed_chunk)
+                            total_compressed_size += len(compressed_chunk)
                 
-                # 체크섬 계산
-                checksum = self.protocol.calculate_checksum(file_data)
+                # 마지막 압축 데이터
+                final_chunk = compressor.flush()
+                if final_chunk:
+                    compressed_chunks.append(final_chunk)
+                    total_compressed_size += len(final_chunk)
                 
-                # 압축
-                compressed_data = self.protocol.compress_data(file_data)
+                checksum = hasher.hexdigest()
+                
+                self.logger.debug(f"파일 크기: {file_size} bytes, 압축 후: {total_compressed_size} bytes")
                 
                 # 업로드 요청 전송
                 await self.protocol.send_message(self.writer, {
                     'command': 'upload',
                     'path': remote_path,
-                    'size': len(compressed_data),
+                    'size': total_compressed_size,
                     'checksum': checksum
                 })
                 
-                # 파일 데이터 전송
-                self.writer.write(compressed_data)
+                self.logger.debug("업로드 요청 메시지 전송 완료")
+                
+                # 압축된 데이터 전송
+                for chunk in compressed_chunks:
+                    self.writer.write(chunk)
                 await self.writer.drain()
+                
+                self.logger.debug("파일 데이터 전송 완료")
                 
                 # 응답 수신
                 response = await self.protocol.receive_message(self.reader)
+                self.logger.debug(f"서버 응답: {response}")
+                
                 if response and response.get('status') == 'success':
                     self.logger.info(f"파일 업로드 완료: {local_path} -> {remote_path}")
                     return True
@@ -369,10 +447,25 @@ class FileTransferClient:
                     error_msg = response.get('message', '알 수 없는 오류') if response else '응답 없음'
                     self.logger.error(f"업로드 실패: {error_msg}")
                     
+            except FileNotFoundError as e:
+                self.logger.error(f"업로드 시도 {attempt + 1} 실패: 파일을 찾을 수 없음 - {local_path}")
+                return False  # 파일이 없으면 재시도할 필요 없음
+            except PermissionError as e:
+                self.logger.error(f"업로드 시도 {attempt + 1} 실패: 권한 없음 - {local_path}")
+                return False  # 권한 문제는 재시도해도 소용없음
+            except MemoryError as e:
+                self.logger.error(f"업로드 시도 {attempt + 1} 실패: 메모리 부족 - 파일이 너무 큽니다")
+                return False  # 메모리 부족은 재시도해도 소용없음
+            except ConnectionError as e:
+                self.logger.error(f"업로드 시도 {attempt + 1} 실패: 연결 오류 - {str(e)}")
+            except asyncio.TimeoutError as e:
+                self.logger.error(f"업로드 시도 {attempt + 1} 실패: 타임아웃 - {str(e)}")
             except Exception as e:
-                self.logger.error(f"업로드 시도 {attempt + 1} 실패: {e}")
-                if attempt < retries:
-                    await asyncio.sleep(1)  # 재시도 전 대기
+                self.logger.error(f"업로드 시도 {attempt + 1} 실패: {type(e).__name__}: {str(e)}")
+                
+            if attempt < retries:
+                self.logger.info(f"1초 후 재시도합니다... ({attempt + 1}/{retries + 1})")
+                await asyncio.sleep(1)  # 재시도 전 대기
                     
         return False
     
