@@ -209,15 +209,14 @@ class FileTransferServer:
             
             self.logger.debug(f"파일 데이터 수신 완료: {len(received_data)} bytes")
             
-            # 스트리밍 압축 해제
+            # 압축 해제
             self.logger.debug("압축 해제 시작")
-            decompressor = zstd.ZstdDecompressor()
-            decompressed_data = decompressor.decompress(received_data)
+            decompressed_data = self.protocol.decompress_data(received_data)
             self.logger.debug(f"압축 해제 완료: {len(decompressed_data)} bytes")
             
             # 체크섬 검증
             self.logger.debug("체크섬 검증 시작")
-            actual_checksum = xxhash.xxh64(decompressed_data).hexdigest()
+            actual_checksum = self.protocol.calculate_checksum(decompressed_data)
             if actual_checksum != expected_checksum:
                 error_msg = f'체크섬 불일치: 예상 {expected_checksum}, 실제 {actual_checksum}'
                 self.logger.error(error_msg)
@@ -392,50 +391,37 @@ class FileTransferClient:
                 file_size = os.path.getsize(local_path)
                 self.logger.debug(f"파일 크기: {file_size} bytes")
                 
-                # 파일을 청크 단위로 읽어서 압축하고 체크섬 계산
-                hasher = xxhash.xxh64()
-                compressor = zstd.ZstdCompressor(level=self.protocol.compression_level)
-                compressed_chunks = []
-                total_compressed_size = 0
+                # 큰 파일의 경우 청크 단위로 처리
+                MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
                 
-                # 스트리밍 압축을 위한 compressor 객체 생성
-                compress_obj = compressor.compressobj()
+                if file_size > MAX_FILE_SIZE:
+                    self.logger.error(f"파일이 너무 큽니다: {file_size} bytes > {MAX_FILE_SIZE} bytes")
+                    return False
                 
+                # 파일 읽기
                 async with aiofiles.open(local_path, 'rb') as f:
-                    while True:
-                        chunk = await f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        
-                        hasher.update(chunk)
-                        compressed_chunk = compress_obj.compress(chunk)
-                        if compressed_chunk:
-                            compressed_chunks.append(compressed_chunk)
-                            total_compressed_size += len(compressed_chunk)
+                    file_data = await f.read()
                 
-                # 마지막 압축 데이터
-                final_chunk = compress_obj.flush()
-                if final_chunk:
-                    compressed_chunks.append(final_chunk)
-                    total_compressed_size += len(final_chunk)
+                # 체크섬 계산
+                checksum = self.protocol.calculate_checksum(file_data)
                 
-                checksum = hasher.hexdigest()
+                # 압축
+                compressed_data = self.protocol.compress_data(file_data)
                 
-                self.logger.debug(f"파일 크기: {file_size} bytes, 압축 후: {total_compressed_size} bytes")
+                self.logger.debug(f"파일 크기: {len(file_data)} bytes, 압축 후: {len(compressed_data)} bytes")
                 
                 # 업로드 요청 전송
                 await self.protocol.send_message(self.writer, {
                     'command': 'upload',
                     'path': remote_path,
-                    'size': total_compressed_size,
+                    'size': len(compressed_data),
                     'checksum': checksum
                 })
                 
                 self.logger.debug("업로드 요청 메시지 전송 완료")
                 
-                # 압축된 데이터 전송
-                for chunk in compressed_chunks:
-                    self.writer.write(chunk)
+                # 파일 데이터 전송
+                self.writer.write(compressed_data)
                 await self.writer.drain()
                 
                 self.logger.debug("파일 데이터 전송 완료")
