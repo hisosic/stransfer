@@ -397,6 +397,9 @@ class FileTransferClient:
                 compressed_chunks = []
                 total_compressed_size = 0
                 
+                # 스트리밍 압축을 위한 compressor 객체 생성
+                compress_obj = compressor.compressobj()
+                
                 async with aiofiles.open(local_path, 'rb') as f:
                     while True:
                         chunk = await f.read(CHUNK_SIZE)
@@ -404,13 +407,13 @@ class FileTransferClient:
                             break
                         
                         hasher.update(chunk)
-                        compressed_chunk = compressor.compress(chunk)
+                        compressed_chunk = compress_obj.compress(chunk)
                         if compressed_chunk:
                             compressed_chunks.append(compressed_chunk)
                             total_compressed_size += len(compressed_chunk)
                 
                 # 마지막 압축 데이터
-                final_chunk = compressor.flush()
+                final_chunk = compress_obj.flush()
                 if final_chunk:
                     compressed_chunks.append(final_chunk)
                     total_compressed_size += len(final_chunk)
