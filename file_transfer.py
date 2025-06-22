@@ -152,6 +152,8 @@ class FileTransferServer:
         self.logger.info(f"클라이언트 연결: {client_addr}")
         
         try:
+            upload_state = None  # 업로드 상태 저장
+            
             while True:
                 message = await self.protocol.receive_message(reader)
                 if not message:
@@ -160,6 +162,15 @@ class FileTransferServer:
                 command = message.get('command')
                 if command == 'upload':
                     await self.handle_upload(reader, writer, message)
+                elif command == 'upload_start':
+                    upload_state = await self.handle_upload_start(reader, writer, message)
+                elif command == 'upload_chunk':
+                    if upload_state:
+                        await self.handle_upload_chunk(reader, writer, message, upload_state)
+                elif command == 'upload_finish':
+                    if upload_state:
+                        await self.handle_upload_finish(reader, writer, upload_state)
+                        upload_state = None
                 elif command == 'download':
                     await self.handle_download(reader, writer, message)
                 elif command == 'list':
@@ -179,8 +190,152 @@ class FileTransferServer:
             await writer.wait_closed()
             self.logger.info(f"클라이언트 연결 종료: {client_addr}")
     
+    async def handle_upload_start(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, message: Dict):
+        """청크 기반 업로드 시작을 처리합니다."""
+        try:
+            target_path = message['path']
+            file_size = message['size']
+            expected_checksum = message['checksum']
+            
+            self.logger.debug(f"청크 업로드 시작: {target_path}, 크기: {file_size} bytes")
+            
+            # 디렉토리 생성
+            target_dir = os.path.dirname(target_path)
+            if target_dir:
+                self.logger.debug(f"디렉토리 생성: {target_dir}")
+                os.makedirs(target_dir, exist_ok=True)
+            
+            # 임시 파일 생성
+            temp_path = target_path + '.tmp'
+            
+            upload_state = {
+                'target_path': target_path,
+                'temp_path': temp_path,
+                'file_size': file_size,
+                'expected_checksum': expected_checksum,
+                'received_size': 0,
+                'file_handle': None,
+                'hasher': xxhash.xxh64()
+            }
+            
+            # 임시 파일 열기
+            upload_state['file_handle'] = await aiofiles.open(temp_path, 'wb')
+            
+            await self.protocol.send_message(writer, {
+                'status': 'ready',
+                'message': '업로드 준비 완료'
+            })
+            
+            return upload_state
+            
+        except Exception as e:
+            error_msg = f'업로드 시작 오류: {type(e).__name__}: {str(e)}'
+            self.logger.error(error_msg)
+            await self.protocol.send_message(writer, {
+                'status': 'error',
+                'message': error_msg
+            })
+            return None
+    
+    async def handle_upload_chunk(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, message: Dict, upload_state: Dict):
+        """청크 데이터를 처리합니다."""
+        try:
+            chunk_size = message['size']
+            original_size = message['original_size']
+            expected_checksum = message['checksum']
+            
+            # 청크 데이터 수신
+            compressed_chunk = await reader.readexactly(chunk_size)
+            
+            # 압축 해제
+            chunk_data = self.protocol.decompress_data(compressed_chunk)
+            
+            # 체크섬 검증
+            actual_checksum = self.protocol.calculate_checksum(chunk_data)
+            if actual_checksum != expected_checksum:
+                error_msg = f'청크 체크섬 불일치: 예상 {expected_checksum}, 실제 {actual_checksum}'
+                self.logger.error(error_msg)
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+                return
+            
+            # 파일에 쓰기
+            await upload_state['file_handle'].write(chunk_data)
+            upload_state['received_size'] += len(chunk_data)
+            upload_state['hasher'].update(chunk_data)
+            
+            # 진행률 로그
+            progress = (upload_state['received_size'] / upload_state['file_size']) * 100
+            if upload_state['received_size'] % (10 * 1024 * 1024) == 0:
+                self.logger.info(f"수신 진행률: {progress:.1f}% ({upload_state['received_size']}/{upload_state['file_size']} bytes)")
+            
+            await self.protocol.send_message(writer, {
+                'status': 'chunk_ok',
+                'message': '청크 처리 완료'
+            })
+            
+        except Exception as e:
+            error_msg = f'청크 처리 오류: {type(e).__name__}: {str(e)}'
+            self.logger.error(error_msg)
+            await self.protocol.send_message(writer, {
+                'status': 'error',
+                'message': error_msg
+            })
+    
+    async def handle_upload_finish(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, upload_state: Dict):
+        """업로드 완료를 처리합니다."""
+        try:
+            # 파일 핸들 닫기
+            if upload_state['file_handle']:
+                await upload_state['file_handle'].close()
+            
+            # 최종 체크섬 검증
+            final_checksum = upload_state['hasher'].hexdigest()
+            if final_checksum != upload_state['expected_checksum']:
+                error_msg = f'최종 체크섬 불일치: 예상 {upload_state["expected_checksum"]}, 실제 {final_checksum}'
+                self.logger.error(error_msg)
+                # 임시 파일 삭제
+                if os.path.exists(upload_state['temp_path']):
+                    os.remove(upload_state['temp_path'])
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+                return
+            
+            # 임시 파일을 최종 파일로 이동
+            os.rename(upload_state['temp_path'], upload_state['target_path'])
+            
+            self.logger.info(f"파일 업로드 완료: {upload_state['target_path']} ({upload_state['received_size']} bytes)")
+            
+            await self.protocol.send_message(writer, {
+                'status': 'success',
+                'message': '파일 업로드 완료'
+            })
+            
+        except Exception as e:
+            error_msg = f'업로드 완료 처리 오류: {type(e).__name__}: {str(e)}'
+            self.logger.error(error_msg)
+            # 임시 파일 정리
+            if upload_state.get('file_handle'):
+                try:
+                    await upload_state['file_handle'].close()
+                except:
+                    pass
+            if os.path.exists(upload_state['temp_path']):
+                try:
+                    os.remove(upload_state['temp_path'])
+                except:
+                    pass
+            await self.protocol.send_message(writer, {
+                'status': 'error',
+                'message': error_msg
+            })
+    
     async def handle_upload(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, message: Dict):
-        """파일 업로드를 처리합니다."""
+        """기존 방식의 파일 업로드를 처리합니다 (하위 호환성)."""
         try:
             target_path = message['path']
             file_size = message['size']
@@ -188,9 +343,20 @@ class FileTransferServer:
             
             self.logger.debug(f"업로드 요청 수신: {target_path}, 크기: {file_size} bytes")
             
+            # 파일 크기 제한 (100MB)
+            MAX_FILE_SIZE = 100 * 1024 * 1024
+            if file_size > MAX_FILE_SIZE:
+                error_msg = f'파일이 너무 큽니다: {file_size} bytes > {MAX_FILE_SIZE} bytes. 청크 업로드를 사용하세요.'
+                self.logger.error(error_msg)
+                await self.protocol.send_message(writer, {
+                    'status': 'error',
+                    'message': error_msg
+                })
+                return
+            
             # 디렉토리 생성
             target_dir = os.path.dirname(target_path)
-            if target_dir:  # 디렉토리가 있는 경우에만 생성
+            if target_dir:
                 self.logger.debug(f"디렉토리 생성: {target_dir}")
                 os.makedirs(target_dir, exist_ok=True)
             
@@ -204,7 +370,7 @@ class FileTransferServer:
                 chunk = await reader.readexactly(chunk_size)
                 received_data += chunk
                 remaining -= len(chunk)
-                if len(received_data) % (1024 * 1024) == 0:  # 1MB마다 로그
+                if len(received_data) % (1024 * 1024) == 0:
                     self.logger.debug(f"수신된 데이터: {len(received_data)}/{file_size} bytes")
             
             self.logger.debug(f"파일 데이터 수신 완료: {len(received_data)} bytes")
@@ -240,36 +406,6 @@ class FileTransferServer:
                 'message': '파일 업로드 완료'
             })
             
-        except asyncio.IncompleteReadError as e:
-            error_msg = f'데이터 읽기 오류: {str(e)}'
-            self.logger.error(error_msg)
-            try:
-                await self.protocol.send_message(writer, {
-                    'status': 'error',
-                    'message': error_msg
-                })
-            except:
-                pass
-        except PermissionError as e:
-            error_msg = f'권한 오류: {str(e)}'
-            self.logger.error(error_msg)
-            try:
-                await self.protocol.send_message(writer, {
-                    'status': 'error',
-                    'message': error_msg
-                })
-            except:
-                pass
-        except OSError as e:
-            error_msg = f'파일 시스템 오류: {str(e)}'
-            self.logger.error(error_msg)
-            try:
-                await self.protocol.send_message(writer, {
-                    'status': 'error',
-                    'message': error_msg
-                })
-            except:
-                pass
         except Exception as e:
             error_msg = f'업로드 오류: {type(e).__name__}: {str(e)}'
             self.logger.error(error_msg)
@@ -391,45 +527,80 @@ class FileTransferClient:
                 file_size = os.path.getsize(local_path)
                 self.logger.debug(f"파일 크기: {file_size} bytes")
                 
-                # 큰 파일의 경우 청크 단위로 처리
-                MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-                
-                if file_size > MAX_FILE_SIZE:
-                    self.logger.error(f"파일이 너무 큽니다: {file_size} bytes > {MAX_FILE_SIZE} bytes")
-                    return False
-                
-                # 파일 읽기
+                # 전체 파일의 체크섬을 먼저 계산
+                hasher = xxhash.xxh64()
                 async with aiofiles.open(local_path, 'rb') as f:
-                    file_data = await f.read()
+                    while True:
+                        chunk = await f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
                 
-                # 체크섬 계산
-                checksum = self.protocol.calculate_checksum(file_data)
+                original_checksum = hasher.hexdigest()
+                self.logger.debug(f"원본 파일 체크섬: {original_checksum}")
                 
-                # 압축
-                compressed_data = self.protocol.compress_data(file_data)
-                
-                self.logger.debug(f"파일 크기: {len(file_data)} bytes, 압축 후: {len(compressed_data)} bytes")
-                
-                # 업로드 요청 전송
+                # 업로드 시작 요청 전송
                 await self.protocol.send_message(self.writer, {
-                    'command': 'upload',
+                    'command': 'upload_start',
                     'path': remote_path,
-                    'size': len(compressed_data),
-                    'checksum': checksum
+                    'size': file_size,
+                    'checksum': original_checksum
                 })
                 
-                self.logger.debug("업로드 요청 메시지 전송 완료")
-                
-                # 파일 데이터 전송
-                self.writer.write(compressed_data)
-                await self.writer.drain()
-                
-                self.logger.debug("파일 데이터 전송 완료")
-                
-                # 응답 수신
+                # 서버 응답 확인
                 response = await self.protocol.receive_message(self.reader)
-                self.logger.debug(f"서버 응답: {response}")
+                if not response or response.get('status') != 'ready':
+                    error_msg = response.get('message', '서버 준비 실패') if response else '응답 없음'
+                    self.logger.error(f"업로드 시작 실패: {error_msg}")
+                    continue
                 
+                self.logger.debug("서버 준비 완료, 파일 전송 시작")
+                
+                # 파일을 청크 단위로 읽어서 전송
+                total_sent = 0
+                async with aiofiles.open(local_path, 'rb') as f:
+                    while total_sent < file_size:
+                        chunk = await f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        
+                        # 청크 압축
+                        compressed_chunk = self.protocol.compress_data(chunk)
+                        chunk_checksum = self.protocol.calculate_checksum(chunk)
+                        
+                        # 청크 정보 전송
+                        await self.protocol.send_message(self.writer, {
+                            'command': 'upload_chunk',
+                            'size': len(compressed_chunk),
+                            'original_size': len(chunk),
+                            'checksum': chunk_checksum
+                        })
+                        
+                        # 청크 데이터 전송
+                        self.writer.write(compressed_chunk)
+                        await self.writer.drain()
+                        
+                        total_sent += len(chunk)
+                        
+                        # 진행률 로그 (10MB마다)
+                        if total_sent % (10 * 1024 * 1024) == 0:
+                            progress = (total_sent / file_size) * 100
+                            self.logger.info(f"전송 진행률: {progress:.1f}% ({total_sent}/{file_size} bytes)")
+                        
+                        # 서버 응답 확인
+                        response = await self.protocol.receive_message(self.reader)
+                        if not response or response.get('status') != 'chunk_ok':
+                            error_msg = response.get('message', '청크 전송 실패') if response else '응답 없음'
+                            self.logger.error(f"청크 전송 실패: {error_msg}")
+                            break
+                
+                # 업로드 완료 요청
+                await self.protocol.send_message(self.writer, {
+                    'command': 'upload_finish'
+                })
+                
+                # 최종 응답 확인
+                response = await self.protocol.receive_message(self.reader)
                 if response and response.get('status') == 'success':
                     self.logger.info(f"파일 업로드 완료: {local_path} -> {remote_path}")
                     return True
@@ -443,9 +614,6 @@ class FileTransferClient:
             except PermissionError as e:
                 self.logger.error(f"업로드 시도 {attempt + 1} 실패: 권한 없음 - {local_path}")
                 return False  # 권한 문제는 재시도해도 소용없음
-            except MemoryError as e:
-                self.logger.error(f"업로드 시도 {attempt + 1} 실패: 메모리 부족 - 파일이 너무 큽니다")
-                return False  # 메모리 부족은 재시도해도 소용없음
             except ConnectionError as e:
                 self.logger.error(f"업로드 시도 {attempt + 1} 실패: 연결 오류 - {str(e)}")
             except asyncio.TimeoutError as e:
